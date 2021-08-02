@@ -52,6 +52,8 @@ class PosTagger(nn.Module):
         pretrained_embedding
     ):
         assert any([use_word, use_char, use_byte]), "you have to give some input to the lstm"
+        if pretrained_embedding is not None and word_embedding_dim < pretrained_embedding.shape[1]:
+            raise AssertionError("word_embedding_dim must be equal to or greater than pretrained embedding dim")
         super().__init__()
         self.use_pretrained_embedding = pretrained_embedding is not None
         self.use_word = use_word
@@ -74,10 +76,9 @@ class PosTagger(nn.Module):
             bidirectional=True,
         )
 
-        word_embedding_dim = word_embedding_dim if pretrained_embedding is None else pretrained_embedding.shape[1]
         self.word_embeddings = nn.Embedding(n_word_embeddings, word_embedding_dim)
         if pretrained_embedding is not None:
-            self.word_embeddings.weight.data = pretrained_embedding
+            self.word_embeddings.weight.data[:, :pretrained_embedding.shape[1]] = pretrained_embedding.clone()
 
         lstm_input_size = 0
         if use_word:

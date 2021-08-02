@@ -70,7 +70,8 @@ class Vocab:
         ]
         vocab_idxs, embeddings_indices = zip(*vocab_embedding_indices)
         rval[vocab_idxs, :] = torch.tensor(
-            embedding.vectors[list(embeddings_indices), :], dtype=torch.float
+            embedding.vectors[list(embeddings_indices), :],
+            dtype=torch.float
         )
         return rval
 
