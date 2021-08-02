@@ -1,3 +1,7 @@
 torch
 fire
 tqdm
+pyicu
+pycld2
+morfessor
+polyglot

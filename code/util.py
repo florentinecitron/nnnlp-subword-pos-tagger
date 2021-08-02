@@ -1,6 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 
+
 @dataclass
 class RollingAverage:
     # for keeping track of loss

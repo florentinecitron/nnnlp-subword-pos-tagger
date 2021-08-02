@@ -48,10 +48,12 @@ class PosTagger(nn.Module):
         noise_sd,
         use_word,
         use_char,
-        use_byte
+        use_byte,
+        pretrained_embedding
     ):
         assert any([use_word, use_char, use_byte]), "you have to give some input to the lstm"
         super().__init__()
+        self.use_pretrained_embedding = pretrained_embedding is not None
         self.use_word = use_word
         self.use_byte = use_byte
         self.use_char = use_char
@@ -71,7 +73,11 @@ class PosTagger(nn.Module):
             hidden_size=int(byte_embedding_dim/2),
             bidirectional=True,
         )
+
+        word_embedding_dim = word_embedding_dim if pretrained_embedding is None else pretrained_embedding.shape[1]
         self.word_embeddings = nn.Embedding(n_word_embeddings, word_embedding_dim)
+        if pretrained_embedding is not None:
+            self.word_embeddings.weight.data = pretrained_embedding
 
         lstm_input_size = 0
         if use_word:
@@ -96,7 +102,8 @@ class PosTagger(nn.Module):
         initrange = 0.5
         self.subtoken_embeddings.weight.data.uniform_(-initrange, initrange)
         self.byte_embeddings.weight.data.uniform_(-initrange, initrange)
-        self.word_embeddings.weight.data.uniform_(-initrange, initrange)
+        if not self.use_pretrained_embedding:
+            self.word_embeddings.weight.data.uniform_(-initrange, initrange)
         self.output_projection.weight.data.uniform_(-initrange, initrange)
         self.output_projection.bias.data.zero_()
 

@@ -7,29 +7,30 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
-from data import Data
+from data import DataRef, Data
 from model import PosTagger
 from util import RollingAverage
 
 
-def train(lang_id: str, n_epochs: int = 2):
-    d = Data.from_lang_id(lang_id, base_path="data")
-    (v_char, v_word, v_bytes, v_label, v_freq_bins), transition_matrix, (train, val, test) = d.get_data()
+def train(lang_id: str, n_epochs: int = 2, use_pretrained_embeddings: bool = False):
+    d = DataRef.from_lang_id(lang_id, base_path="data")
+    data = d.get_data()
 
     net = self = PosTagger(
-        n_subtoken_embeddings=len(v_char),
+        n_subtoken_embeddings=len(data.v_char),
         subtoken_embedding_dim=100,
-        n_byte_embeddings=len(v_bytes),
+        n_byte_embeddings=len(data.v_bytes),
         byte_embedding_dim=100,
-        n_word_embeddings=len(v_word),
+        n_word_embeddings=len(data.v_word),
         word_embedding_dim=128,
         hidden_size=100,
-        n_out=len(v_label),
-        n_freq_bins=len(v_freq_bins),
+        n_out=len(data.v_label),
+        n_freq_bins=len(data.v_freq_bin),
         noise_sd=.2,
         use_word=True,
         use_char=False,
-        use_byte=True
+        use_byte=True,
+        pretrained_embedding=data.embeddings if use_pretrained_embeddings else None
     )
 
     # X = example = {
@@ -46,14 +47,14 @@ def train(lang_id: str, n_epochs: int = 2):
 
     with pbar_epoch:
 
-        pbar_example = tqdm(total=len(train), position=1, desc="Training examples")
+        pbar_example = tqdm(total=len(data.train), position=1, desc="Training examples")
         with pbar_example:
             for epoch in range(n_epochs):
-                random.shuffle(train)
+                random.shuffle(data.train)
                 net.train()
                 loss_average = RollingAverage.make(100)
 
-                for ex in train:
+                for ex in data.train:
                     optimizer.zero_grad()
                     outputs_label, outputs_freq_bin = net(ex, return_freq_bins=True)
                     loss = torch.tensor(0.0)
@@ -78,7 +79,7 @@ def train(lang_id: str, n_epochs: int = 2):
 
                 net.eval()
                 acc, total = 0, 0
-                for ex in val:
+                for ex in data.val:
                     outputs = net(ex, return_freq_bins=False)
                     preds = outputs.argmax(axis=2).squeeze().tolist()
                     if not isinstance(preds, list):
@@ -90,9 +91,10 @@ def train(lang_id: str, n_epochs: int = 2):
                 pbar_epoch.set_description(f"Epochs (accuracy: {round(accuracy, 4)})")
                 pbar_epoch.update(1)
 
-def eval(
-    lang_id,
-):
+    return data, net
+
+
+def eval(lang_id):
     pass
 
 
