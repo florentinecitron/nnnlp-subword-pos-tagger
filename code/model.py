@@ -107,6 +107,8 @@ class PosTagger(nn.Module):
             self.word_embeddings.weight.data.uniform_(-initrange, initrange)
         self.output_projection.weight.data.uniform_(-initrange, initrange)
         self.output_projection.bias.data.zero_()
+        self.output_projection_freq_bin.weight.data.uniform_(-initrange, initrange)
+        self.output_projection_freq_bin.bias.data.zero_()
 
     def forward(self, X, return_freq_bins):
         # so far no batching, X is a dictionary with keys "chars" and "tokens"
@@ -135,7 +137,6 @@ class PosTagger(nn.Module):
         if self.use_word:
             _combined_reps.append(word_reps)
         combined_reps = torch.cat(_combined_reps, axis=1)[None, :, :]
-        #combined_reps = word_reps[None, :, :]
 
         output, (h_n, c_n) = self.lstm(combined_reps)
 

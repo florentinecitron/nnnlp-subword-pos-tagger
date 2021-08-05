@@ -100,13 +100,13 @@ class DataRef:
         return cls(lang, ud_lang_id, ud_lang, base_path, base_embeddings_path)
 
     def train_file(self):
-        return f"{self.base_path}/universal-dependencies-1.2/{self.ud_lang_id}/{self.ud_lang}-ud-dev.conllu"
+        return f"{self.base_path}/universal-dependencies-1.2/{self.ud_lang_id}/{self.ud_lang}-ud-train.conllu"
 
     def dev_file(self):
         return f"{self.base_path}/universal-dependencies-1.2/{self.ud_lang_id}/{self.ud_lang}-ud-dev.conllu"
 
     def test_file(self):
-        return f"{self.base_path}/universal-dependencies-1.2/{self.ud_lang_id}/{self.ud_lang}-ud-dev.conllu"
+        return f"{self.base_path}/universal-dependencies-1.2/{self.ud_lang_id}/{self.ud_lang}-ud-test.conllu"
 
     def get_freq_bins(self):
         with open(self.train_file()) as i:
@@ -182,7 +182,9 @@ class DataRef:
                         + [v_label.get(t["udpos"]) for t in s]
                         + [v_label.get("</s>")]
                     )
+
                     example = {
+                        "padded_forms": [None]+[t["form"] for t in s]+[None],
                         "tokens": tokens_indices,
                         "chars": char_indices,
                         "bytes": bytes_indices,
