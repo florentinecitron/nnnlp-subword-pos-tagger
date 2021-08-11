@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
+torch.manual_seed(111)
+
 """
 Our basic bi-LSTM tagging model is a context bi-LSTM taking as input word embeddings~w.
 We compute subtoken-level (either characters ~c or unicode byte ~b) embed-dings of words using a sequence bi-LSTM at the
@@ -59,76 +61,83 @@ class PosTagger(nn.Module):
         self.use_word = use_word
         self.use_byte = use_byte
         self.use_char = use_char
-        self.subtoken_embeddings = nn.Embedding(
-            n_subtoken_embeddings, subtoken_embedding_dim
-        )
-        self.subtoken_lstm = nn.LSTM(
-            input_size=subtoken_embedding_dim,
-            hidden_size=int(subtoken_embedding_dim/2),
-            bidirectional=True,
-        )
-        self.byte_embeddings = nn.Embedding(
-            n_byte_embeddings, byte_embedding_dim
-        )
-        self.byte_lstm = nn.LSTM(
-            input_size=byte_embedding_dim,
-            hidden_size=int(byte_embedding_dim/2),
-            bidirectional=True,
-        )
+        if self.use_char:
+            self.subtoken_embeddings = nn.Embedding(
+                n_subtoken_embeddings, subtoken_embedding_dim, padding_idx=0
+            )
+            self.subtoken_lstm = nn.LSTM(
+                input_size=subtoken_embedding_dim,
+                hidden_size=subtoken_embedding_dim,
+                bidirectional=True,
+                num_layers=1,
+                #dropout=.2
+            )
+        if self.use_byte:
+            self.byte_embeddings = nn.Embedding(
+                n_byte_embeddings, byte_embedding_dim, padding_idx=0
+            )
+            self.byte_lstm = nn.LSTM(
+                input_size=byte_embedding_dim,
+                hidden_size=byte_embedding_dim,
+                bidirectional=True,
+                num_layers=1,
+                #dropout=.2
+            )
 
-        self.word_embeddings = nn.Embedding(n_word_embeddings, word_embedding_dim)
-        if pretrained_embedding is not None:
-            self.word_embeddings.weight.data[:, :pretrained_embedding.shape[1]] = pretrained_embedding.clone()
+        if self.use_word:
+            if pretrained_embedding is not None:
+                word_embedding_dim = pretrained_embedding.shape[1]
+            self.word_embeddings = nn.Embedding(n_word_embeddings, word_embedding_dim)
+            if pretrained_embedding is not None:
+                self.word_embeddings.weight.data = pretrained_embedding.clone()
 
         lstm_input_size = 0
         if use_word:
             lstm_input_size += word_embedding_dim
         if use_char:
-            lstm_input_size += subtoken_embedding_dim
+            lstm_input_size += subtoken_embedding_dim * 2
         if use_byte:
-            lstm_input_size += byte_embedding_dim
+            lstm_input_size += byte_embedding_dim * 2
+
+        #self.embed_bias = nn.Linear(lstm_input_size, lstm_input_size)
 
         self.lstm = nn.LSTM(
             input_size=lstm_input_size,
             hidden_size=hidden_size,
             bidirectional=True,
-            num_layers=2,
+            num_layers=1,
+            #dropout=.2
         )
         self.output_projection = nn.Linear(hidden_size * 2, n_out)
+        #self.output_projection = nn.Sequential(nn.Linear(hidden_size * 2, 50), nn.Tanh(), nn.Linear(50, n_out))
         self.output_projection_freq_bin = nn.Linear(hidden_size * 2, n_freq_bins)
         self.noise_sd = noise_sd
-        self.init_weights()
 
-    def init_weights(self):
-        initrange = 0.5
-        self.subtoken_embeddings.weight.data.uniform_(-initrange, initrange)
-        self.byte_embeddings.weight.data.uniform_(-initrange, initrange)
-        if not self.use_pretrained_embedding:
-            self.word_embeddings.weight.data.uniform_(-initrange, initrange)
-        self.output_projection.weight.data.uniform_(-initrange, initrange)
-        self.output_projection.bias.data.zero_()
-        self.output_projection_freq_bin.weight.data.uniform_(-initrange, initrange)
-        self.output_projection_freq_bin.bias.data.zero_()
-
-    def forward(self, X, return_freq_bins):
+    def forward(self, X, return_freq_bins, train=True):
         # so far no batching, X is a dictionary with keys "chars" and "tokens"
         # the paper doesn't use mini batches so it's ok
 
-        padded_chars = pad_sequence(
-            [torch.tensor(t, dtype=torch.long) for t in X["chars"]]
-        )
-        char_embeds = self.subtoken_embeddings(padded_chars)
-        output_char, (h_n_char, c_n_char) = self.subtoken_lstm(char_embeds)
-        char_reps = h_n_char.permute(1, 0, 2).reshape(h_n_char.shape[1], -1)
+        if self.use_char:
+            padded_chars = pad_sequence(
+                [torch.tensor(t, dtype=torch.long) for t in X["chars"]],
+                padding_value=0
+            )
+            char_embeds = self.subtoken_embeddings(padded_chars)
+            _, (h_n_char, _) = self.subtoken_lstm(char_embeds)
+            char_reps = h_n_char.permute(1, 0, 2).reshape(h_n_char.shape[1], -1)
 
-        padded_byte = pad_sequence(
-            [torch.tensor(t, dtype=torch.long) for t in X["bytes"]]
-        )
-        byte_embeds = self.byte_embeddings(padded_byte)
-        output_byte, (h_n_byte, c_n_byte) = self.byte_lstm(byte_embeds)
-        byte_reps = h_n_byte.permute(1, 0, 2).reshape(h_n_byte.shape[1], -1)
+        if self.use_byte:
+            padded_byte = pad_sequence(
+                [torch.tensor(t, dtype=torch.long) for t in X["bytes"]],
+                padding_value=0
+            )
+            byte_embeds = self.byte_embeddings(padded_byte)
+            _, (h_n_byte, _) = self.byte_lstm(byte_embeds)
+            byte_reps = h_n_byte.permute(1, 0, 2).reshape(h_n_byte.shape[1], -1)
 
-        word_reps = self.word_embeddings(torch.tensor(X["tokens"], dtype=torch.long))
+        if self.use_word:
+            word_reps = self.word_embeddings(torch.tensor(X["tokens"], dtype=torch.long))
+
         _combined_reps = []
         if self.use_byte:
             _combined_reps.append(byte_reps)
@@ -136,12 +145,31 @@ class PosTagger(nn.Module):
             _combined_reps.append(char_reps)
         if self.use_word:
             _combined_reps.append(word_reps)
-        combined_reps = torch.cat(_combined_reps, axis=1)[None, :, :]
+        _combined_reps = torch.cat(_combined_reps, axis=1)[None, :, :]
 
-        output, (h_n, c_n) = self.lstm(combined_reps)
+        if train:
+            combined_reps = _combined_reps + (torch.randn_like(_combined_reps) * self.noise_sd)
+        else:
+            combined_reps = _combined_reps
 
-        rval = self.output_projection(output)
+        output = self.lstm(combined_reps)[0][-1]
+
+        #print(X)
+        #print(output.shape)
+
+        if train:
+            rval = self.output_projection(output + (torch.randn_like(output) * self.noise_sd))
+        else:
+            rval = self.output_projection(output)
+
+        #print(rval.shape)
+        #print()
+
         if not return_freq_bins:
-            return rval + (torch.randn_like(rval) * self.noise_sd)
-        rval_freq_bin = self.output_projection_freq_bin(output)
-        return F.log_softmax(rval + (torch.randn_like(rval) * self.noise_sd), dim=2), F.log_softmax(rval_freq_bin, dim=2)
+            return rval
+        if train:
+            rval_freq_bin = self.output_projection_freq_bin(output + (torch.randn_like(output) * self.noise_sd))
+        else:
+            rval_freq_bin = self.output_projection_freq_bin(output)
+
+        return rval, rval_freq_bin

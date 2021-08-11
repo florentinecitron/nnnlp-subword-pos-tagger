@@ -1,6 +1,9 @@
 import copy
 import csv
 import random
+import sys
+from collections import Counter
+from typing import Optional
 
 import fire
 from tqdm import tqdm
@@ -16,31 +19,32 @@ from util import RollingAverage
 def train(
     lang_id: str,
     n_epochs: int = 20,
+    patience: Optional[int] = None,
     use_pretrained_embeddings: bool = False,
     use_word: bool = True,
     use_char: bool = False,
     use_byte: bool = True,
     use_freq_bin: bool = True,
-    pbar_start_pos: int = 0
+    unknown_probability: float = 0.2,
+    show_progress_bar: bool = False,
 ):
     d = DataRef.from_lang_id(lang_id, base_path="data")
-    data = d.get_data()
-
+    data = d.get_data(with_embeddings=use_pretrained_embeddings)
     net = PosTagger(
         n_subtoken_embeddings=len(data.v_char),
         subtoken_embedding_dim=100,
         n_byte_embeddings=len(data.v_bytes),
         byte_embedding_dim=100,
         n_word_embeddings=len(data.v_word),
-        word_embedding_dim=128,
+        word_embedding_dim=64,
         hidden_size=100,
         n_out=len(data.v_label),
         n_freq_bins=len(data.v_freq_bin),
-        noise_sd=.2,
+        noise_sd=0.2,
         use_word=use_word,
         use_char=use_char,
         use_byte=use_byte,
-        pretrained_embedding=data.embeddings if use_pretrained_embeddings else None
+        pretrained_embedding=data.embeddings if use_pretrained_embeddings else None,
     )
 
     # X = example = {
@@ -53,29 +57,43 @@ def train(
     criterion_label = nn.CrossEntropyLoss()
     criterion_freq_bin = nn.CrossEntropyLoss()
 
-    pbar_epoch = tqdm(total=n_epochs, desc="Epochs", leave=False)
+    pbar_epoch = tqdm(
+        total=n_epochs, desc="Epochs", leave=False, disable=not show_progress_bar
+    )
 
-    best_model, best_val_acc = None, float("-inf")
+    best_model, best_val_acc, best_model_seen = None, float("-inf"), 0
+    pbar_example = tqdm(
+        total=len(data.train),
+        desc="Training examples",
+        leave=False,
+        disable=not show_progress_bar,
+    )
 
-    pbar_example = tqdm(total=len(data.train), desc="Training examples", leave=False)
-    for epoch in range(n_epochs):
+    for _ in range(n_epochs):
         random.shuffle(data.train)
+        # net = copy.deepcopy(best_model)
         net.train()
-        loss_average = RollingAverage.make(100)
-
+        loss_average = RollingAverage.make(1000)
         for ex in data.train:
             optimizer.zero_grad()
-            outputs_label, outputs_freq_bin = net(ex, return_freq_bins=True)
+            ex_with_unk = data.v_word.add_random_unk(ex, unknown_probability)
+            if use_freq_bin:
+                outputs_label, outputs_freq_bin = net(
+                    ex_with_unk, return_freq_bins=True, train=True
+                )
+            else:
+                outputs_label = net(ex_with_unk, return_freq_bins=False, train=True)
             loss = torch.tensor(0.0)
             for idx, (label, freq_bin) in enumerate(zip(ex["labels"], ex["freq_bins"])):
                 loss_label = criterion_label(
-                    outputs_label[:, idx, :].squeeze()[None, :],
+                    outputs_label[idx, :].squeeze()[None, :],
                     torch.tensor([label], dtype=torch.long),
                 )
+
                 loss += loss_label
                 if use_freq_bin:
                     loss_freq_bin = criterion_freq_bin(
-                        outputs_freq_bin[:, idx, :].squeeze()[None, :],
+                        outputs_freq_bin[idx, :].squeeze()[None, :],
                         torch.tensor([freq_bin], dtype=torch.long),
                     )
                     loss += loss_freq_bin
@@ -88,22 +106,44 @@ def train(
             )
 
         net.eval()
-        acc, total = 0, 0
-        for ex in data.val:
-            outputs = net(ex, return_freq_bins=False)
-            preds = outputs.argmax(axis=2).squeeze().tolist()
-            if not isinstance(preds, list):
-                preds = [preds]
-            for pred, correct in zip(preds, ex["labels"]):
-                total += 1
-                acc += int(pred == correct)
-        accuracy = acc / total
-        if accuracy > best_val_acc:
-            best_val_acc = accuracy
-            best_model = copy.deepcopy(net)
+        with torch.no_grad():
+            acc, total = 0, 0
+            n_correct_oov, total_oov = 0, 0
+            incorrect_counts = Counter()
 
-        pbar_epoch.set_description(f"Epochs (accuracy: {round(accuracy, 4)})")
+            for ex in data.val:
+                outputs = net(ex, return_freq_bins=False, train=False)
+                preds = outputs.argmax(axis=1).squeeze().tolist()
+                if not isinstance(preds, list):
+                    preds = [preds]
+                for pred, correct, form in list(
+                    zip(preds, ex["labels"], ex["padded_forms"])
+                ):
+                    total += 1
+                    is_correct = int(pred == correct)
+                    acc += is_correct
+                    incorrect_counts[(pred, correct)] += 1
+                    if form is not None and form not in data.v_word.w2i:
+                        total_oov += 1
+                        n_correct_oov += is_correct
+
+            accuracy = acc / total
+            if accuracy > best_val_acc:
+                best_val_acc = accuracy
+                best_model = copy.deepcopy(net)
+                best_model_seen = 0
+            else:
+                best_model_seen += 1
+            accuracy_oov = n_correct_oov / total_oov
+
+            if patience is not None and best_model_seen > patience:
+                break
+
+        pbar_epoch.set_description(
+            f"Epochs (accuracy: {round(accuracy, 4)}, accuracy_oov: {round(accuracy_oov, 4)})"
+        )
         pbar_epoch.update(1)
+        pbar_example.reset()
 
     return data, best_model
 
@@ -113,11 +153,13 @@ def evaluate(data, net):
     n_correct, total = 0, 0
     n_correct_oov, total_oov = 0, 0
     for ex in data.test:
-        outputs = net(ex, return_freq_bins=False)
-        preds = outputs.argmax(axis=2).squeeze().tolist()
+        outputs = net(ex, return_freq_bins=False, train=False)
+        preds = outputs.argmax(axis=1).squeeze().tolist()
         if not isinstance(preds, list):
             preds = [preds]
-        for pred_label, correct_label, form in zip(preds, ex["labels"], ex["padded_forms"]):
+        for pred_label, correct_label, form in list(
+            zip(preds, ex["labels"], ex["padded_forms"])
+        ):
             total += 1
             is_correct = int(pred_label == correct_label)
             n_correct += is_correct
@@ -130,7 +172,10 @@ def evaluate(data, net):
 
 
 def run_experiment(out_file: str):
-    langs = ["en", "de", "id"]
+    show_progress_bar = True
+
+    #langs = ["en", "id", "de", "fi"]
+    langs = ["fi"]
 
     experiments = {
         "w": {
@@ -138,67 +183,82 @@ def run_experiment(out_file: str):
             "use_word": True,
             "use_char": False,
             "use_byte": False,
-            "use_freq_bin": False
+            "use_freq_bin": False,
         },
         "c": {
             "use_pretrained_embeddings": False,
             "use_word": False,
             "use_char": True,
             "use_byte": False,
-            "use_freq_bin": False
+            "use_freq_bin": False,
         },
         "c+b": {
             "use_pretrained_embeddings": False,
             "use_word": False,
             "use_char": True,
             "use_byte": True,
-            "use_freq_bin": False
+            "use_freq_bin": False,
         },
         "w+c": {
             "use_pretrained_embeddings": False,
             "use_word": True,
             "use_char": True,
             "use_byte": False,
-            "use_freq_bin": False
+            "use_freq_bin": False,
         },
         "w+c+POLYGLOT": {
             "use_pretrained_embeddings": True,
             "use_word": True,
             "use_char": True,
             "use_byte": False,
-            "use_freq_bin": False
+            "use_freq_bin": False,
         },
         "w+c+POLYGLOT+FreqBin": {
             "use_pretrained_embeddings": True,
             "use_word": True,
             "use_char": True,
             "use_byte": False,
-            "use_freq_bin": True
+            "use_freq_bin": True,
         },
     }
 
-    pbar_lang = tqdm(total=3, desc="Languages", leave=True)
+    pbar_lang = tqdm(total=3, desc="Languages", leave=True, disable=not show_progress_bar)
 
-    with open(out_file, "w") as o:
-        writer = csv.DictWriter(o, fieldnames=["lang", "experiment", "accuracy", "accuracy_oov"])
+    with open(out_file, "a") as o:
+        writer = csv.DictWriter(
+            o, fieldnames=["lang", "experiment", "accuracy", "accuracy_oov"]
+        )
 
-        for lang in langs:
-            pbar_lang.set_description(f"Language {lang}")
+        try:
+            for lang in langs:
+                pbar_lang.set_description(f"Language {lang}")
 
-            pbar_experiment = tqdm(total=3, desc="Experiments", leave=False)
+                pbar_experiment = tqdm(
+                    total=len(experiments),
+                    desc="Experiments",
+                    leave=False,
+                    disable=not show_progress_bar,
+                )
 
-            for experiment_name, experiment_params in experiments.items():
+                for experiment_name, experiment_params in experiments.items():
 
-                pbar_experiment.set_description(f"Experiment {experiment_name}")
+                    pbar_experiment.set_description(f"Experiment {experiment_name}")
 
-                data, net = train(lang_id=lang, pbar_start_pos=2, **experiment_params)
-                results = evaluate(data, net)
+                    data, net = train(lang_id=lang, show_progress_bar=show_progress_bar, **experiment_params)
+                    results = evaluate(data, net)
 
-                writer.writerow({"lang": lang, "experiment": experiment_name, **results})
+                    writer.writerow(
+                        {"lang": lang, "experiment": experiment_name, **results}
+                    )
+                    o.flush()
 
-                pbar_experiment.update(1)
+                    pbar_experiment.update(1)
 
-            pbar_lang.update(1)
+                pbar_lang.update(1)
+
+        except KeyboardInterrupt:
+            pass
+
 
 if __name__ == "__main__":
     fire.Fire()
