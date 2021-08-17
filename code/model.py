@@ -2,37 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+from lstm import LSTM
 
 torch.manual_seed(111)
-
-"""
-Our basic bi-LSTM tagging model is a context bi-LSTM taking as input word embeddings~w.
-We compute subtoken-level (either characters ~c or unicode byte ~b) embed-dings of words using a sequence bi-LSTM at the
-This representation is then concate-nated with the (learned) word embeddings vector ~w which forms the input to the context bi-LSTM atthe next layer
-
-For all models we use the same hyperparameters,which  were  set  on  English  dev,  i.e.,
-
-SGD  train-ing with cross-entropy loss,
-no mini-batches,
-20 epochs
-default learning rate (0.1),
-128 dimensions for word embeddings,
-100 for character and byte embeddings,
-100 hidden states
-Gaussian noise with σ=0.2.
-
-use a fixed seed throughout
-
-Embeddings are not initialized  with  pre-trained  embeddings,  except when reported otherwise.
-In that case we use off-the-shelf polyglot embeddings
-
-For languages with token segmen-tation  ambiguity  we  use  the  provided  gold  seg-mentation.
-If  there  is  more  than  one  treebank per  language,  we  use  the  treebank  that  has  the canonical language name (e.g.,Finnish instead ofFinnish-FTB).
-
-The  bi-LSTM  model  performs  already  surpris-ingly well after only 500 training sentences
-
-We  investigated  the  susceptibility of the models to noise,  by artificially corrupting training labels.
-"""
 
 
 class PosTagger(nn.Module):
@@ -57,6 +29,8 @@ class PosTagger(nn.Module):
         if pretrained_embedding is not None and word_embedding_dim < pretrained_embedding.shape[1]:
             raise AssertionError("word_embedding_dim must be equal to or greater than pretrained embedding dim")
         super().__init__()
+        # where unknown tokens should use random embeddings
+        self.unk_to_random_embed = False
         self.use_pretrained_embedding = pretrained_embedding is not None
         self.use_word = use_word
         self.use_byte = use_byte
@@ -99,13 +73,10 @@ class PosTagger(nn.Module):
         if use_byte:
             lstm_input_size += byte_embedding_dim * 2
 
-        #self.embed_bias = nn.Linear(lstm_input_size, lstm_input_size)
-
-        self.lstm = nn.LSTM(
+        self.lstm = nn.LSTM (
             input_size=lstm_input_size,
             hidden_size=hidden_size,
-            bidirectional=True,
-            num_layers=1,
+            bidirectional=True
             #dropout=.2
         )
         self.output_projection = nn.Linear(hidden_size * 2, n_out)
@@ -137,6 +108,8 @@ class PosTagger(nn.Module):
 
         if self.use_word:
             word_reps = self.word_embeddings(torch.tensor(X["tokens"], dtype=torch.long))
+            if self.unk_to_random_embed:
+                word_reps[X["unk_indices"], :] = torch.randn_like(word_reps[X["unk_indices"], :])
 
         _combined_reps = []
         if self.use_byte:
@@ -152,18 +125,12 @@ class PosTagger(nn.Module):
         else:
             combined_reps = _combined_reps
 
-        output = self.lstm(combined_reps)[0][-1]
-
-        #print(X)
-        #print(output.shape)
+        output = torch.tanh(self.lstm(combined_reps)[0]).permute(1,0,2)
 
         if train:
             rval = self.output_projection(output + (torch.randn_like(output) * self.noise_sd))
         else:
             rval = self.output_projection(output)
-
-        #print(rval.shape)
-        #print()
 
         if not return_freq_bins:
             return rval

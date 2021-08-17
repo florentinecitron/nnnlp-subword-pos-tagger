@@ -86,7 +86,6 @@ class Vocab:
         return len(self.w2i)
 
     def convert_embedding(self, embedding):
-        rval = torch.zeros((len(self), embedding.vectors.shape[1]))
         embedding_word_id = embedding.vocabulary.word_id
 
         for w in set(embedding.vocabulary.word_id) - set(self.w2i.keys()):
@@ -97,6 +96,7 @@ class Vocab:
             if word in embedding_word_id or word.lower() in embedding_word_id
         ]
         vocab_idxs, embeddings_indices = zip(*vocab_embedding_indices)
+        rval = torch.zeros((len(self), embedding.vectors.shape[1]))
         rval[vocab_idxs, :] = torch.tensor(
             embedding.vectors[list(embeddings_indices), :],
             dtype=torch.float
@@ -236,6 +236,8 @@ class DataRef:
                             [v_freq_bin.get(w_freq_bins[t["form"]]) for t in s]
                         )
                         example["freq_bins"] = freq_bins
+                    else:
+                        example["unk_indices"] = [idx == v_word.w2i["<unk>"] for idx in example["tokens"]]
 
                     split.append(example)
             splits.append(split)

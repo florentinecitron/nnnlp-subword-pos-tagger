@@ -1,15 +1,16 @@
 import copy
 import csv
+import itertools as it
 import random
 import sys
 from collections import Counter
-from typing import Optional
+from typing import Dict, List, Optional
 
 import fire
-from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 
 from data import DataRef
 from model import PosTagger
@@ -27,6 +28,7 @@ def train(
     use_freq_bin: bool = True,
     unknown_probability: float = 0.2,
     show_progress_bar: bool = False,
+    train_use_n_examples: Optional[int] = None
 ):
     d = DataRef.from_lang_id(lang_id, base_path="data")
     data = d.get_data(with_embeddings=use_pretrained_embeddings)
@@ -36,7 +38,7 @@ def train(
         n_byte_embeddings=len(data.v_bytes),
         byte_embedding_dim=100,
         n_word_embeddings=len(data.v_word),
-        word_embedding_dim=64,
+        word_embedding_dim=64, # accidentally used 64 as dimension
         hidden_size=100,
         n_out=len(data.v_label),
         n_freq_bins=len(data.v_freq_bin),
@@ -62,20 +64,24 @@ def train(
     )
 
     best_model, best_val_acc, best_model_seen = None, float("-inf"), 0
+    train_data = list(it.islice(data.train, 0, train_use_n_examples))
     pbar_example = tqdm(
-        total=len(data.train),
+        total=len(train_data),
         desc="Training examples",
         leave=False,
         disable=not show_progress_bar,
     )
 
+
+
     for _ in range(n_epochs):
-        random.shuffle(data.train)
+        random.shuffle(train_data)
         # net = copy.deepcopy(best_model)
-        net.train()
+        #net.train()
         loss_average = RollingAverage.make(1000)
-        for ex in data.train:
+        for ex in train_data: #it.islice(data.train, 0, 200):
             optimizer.zero_grad()
+            #ex_with_unk = ex
             ex_with_unk = data.v_word.add_random_unk(ex, unknown_probability)
             if use_freq_bin:
                 outputs_label, outputs_freq_bin = net(
@@ -83,17 +89,26 @@ def train(
                 )
             else:
                 outputs_label = net(ex_with_unk, return_freq_bins=False, train=True)
-            loss = torch.tensor(0.0)
+
+            #print(outputs_label.tolist())
+            #print("correct", ex["labels"])
+            #preds = outputs_label.argmax(dim=2).squeeze().tolist()
+            #print("pred", preds)
+
+            loss = None
             for idx, (label, freq_bin) in enumerate(zip(ex["labels"], ex["freq_bins"])):
                 loss_label = criterion_label(
-                    outputs_label[idx, :].squeeze()[None, :],
+                    outputs_label[idx, :],
                     torch.tensor([label], dtype=torch.long),
                 )
-
-                loss += loss_label
+                #print(loss_label.item())
+                if loss is None:
+                    loss = loss_label
+                else:
+                    loss += loss_label
                 if use_freq_bin:
                     loss_freq_bin = criterion_freq_bin(
-                        outputs_freq_bin[idx, :].squeeze()[None, :],
+                        outputs_freq_bin[idx, :],
                         torch.tensor([freq_bin], dtype=torch.long),
                     )
                     loss += loss_freq_bin
@@ -105,15 +120,16 @@ def train(
                 f"Training examples (loss: {round(loss_average.get_val(), 2)})"
             )
 
-        net.eval()
+        #net.eval()
         with torch.no_grad():
             acc, total = 0, 0
             n_correct_oov, total_oov = 0, 0
-            incorrect_counts = Counter()
+            #incorrect_counts = Counter()
 
             for ex in data.val:
                 outputs = net(ex, return_freq_bins=False, train=False)
-                preds = outputs.argmax(axis=1).squeeze().tolist()
+                preds = outputs.argmax(dim=2).squeeze().tolist()
+                #print(preds)
                 if not isinstance(preds, list):
                     preds = [preds]
                 for pred, correct, form in list(
@@ -122,7 +138,7 @@ def train(
                     total += 1
                     is_correct = int(pred == correct)
                     acc += is_correct
-                    incorrect_counts[(pred, correct)] += 1
+                    #incorrect_counts[(pred, correct)] += 1
                     if form is not None and form not in data.v_word.w2i:
                         total_oov += 1
                         n_correct_oov += is_correct
@@ -154,7 +170,7 @@ def evaluate(data, net):
     n_correct_oov, total_oov = 0, 0
     for ex in data.test:
         outputs = net(ex, return_freq_bins=False, train=False)
-        preds = outputs.argmax(axis=1).squeeze().tolist()
+        preds = outputs.argmax(dim=2).squeeze().tolist()
         if not isinstance(preds, list):
             preds = [preds]
         for pred_label, correct_label, form in list(
@@ -171,11 +187,49 @@ def evaluate(data, net):
     return {"accuracy": accuracy, "accuracy_oov": accuracy_oov}
 
 
-def run_experiment(out_file: str):
+def _run_experiment(experiments: dict, langs: List[str], out_file: str):
     show_progress_bar = True
 
-    #langs = ["en", "id", "de", "fi"]
-    langs = ["fi"]
+    pbar_lang = tqdm(total=len(langs), desc="Languages", leave=True, disable=not show_progress_bar)
+
+    with open(out_file, "a") as o:
+        writer = csv.DictWriter(
+            o, fieldnames=["lang", "experiment", "accuracy", "accuracy_oov"]
+        )
+
+        try:
+            for lang in langs:
+                pbar_lang.set_description(f"Language {lang}")
+
+                pbar_experiment = tqdm(
+                    total=len(experiments),
+                    desc="Experiments",
+                    leave=False,
+                    disable=not show_progress_bar,
+                )
+
+                for experiment_name, experiment_params in experiments.items():
+
+                    pbar_experiment.set_description(f"Experiment {experiment_name}")
+
+                    data, net = train(lang_id=lang, show_progress_bar=show_progress_bar, **experiment_params)
+                    results = evaluate(data, net)
+
+                    writer.writerow(
+                        {"lang": lang, "experiment": experiment_name, **results}
+                    )
+                    o.flush()
+
+                    pbar_experiment.update(1)
+
+                pbar_lang.update(1)
+
+        except KeyboardInterrupt:
+            pass
+
+
+def run_experiment(out_file: str):
+    langs = ["en", "id", "de", "fi"]
 
     experiments = {
         "w": {
@@ -221,43 +275,23 @@ def run_experiment(out_file: str):
             "use_freq_bin": True,
         },
     }
+    _run_experiment(experiments, langs, out_file)
 
-    pbar_lang = tqdm(total=3, desc="Languages", leave=True, disable=not show_progress_bar)
 
-    with open(out_file, "a") as o:
-        writer = csv.DictWriter(
-            o, fieldnames=["lang", "experiment", "accuracy", "accuracy_oov"]
-        )
-
-        try:
-            for lang in langs:
-                pbar_lang.set_description(f"Language {lang}")
-
-                pbar_experiment = tqdm(
-                    total=len(experiments),
-                    desc="Experiments",
-                    leave=False,
-                    disable=not show_progress_bar,
-                )
-
-                for experiment_name, experiment_params in experiments.items():
-
-                    pbar_experiment.set_description(f"Experiment {experiment_name}")
-
-                    data, net = train(lang_id=lang, show_progress_bar=show_progress_bar, **experiment_params)
-                    results = evaluate(data, net)
-
-                    writer.writerow(
-                        {"lang": lang, "experiment": experiment_name, **results}
-                    )
-                    o.flush()
-
-                    pbar_experiment.update(1)
-
-                pbar_lang.update(1)
-
-        except KeyboardInterrupt:
-            pass
+def run_experiments_data_size(out_file: str):
+    langs = ["de", "en", "fi", "id"]
+    experiments = {
+        f"n_{n}": {
+            "use_pretrained_embeddings": True,
+            "use_word": True,
+            "use_char": True,
+            "use_byte": False,
+            "use_freq_bin": False,
+            "train_use_n_examples": n,
+            "n_epochs": 10
+        } for n in [100, 200, 400, 800, 1600]
+    }
+    _run_experiment(experiments, langs, out_file)
 
 
 if __name__ == "__main__":
